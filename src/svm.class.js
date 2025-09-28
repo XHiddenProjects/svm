@@ -1,12 +1,12 @@
-class SVM{
+class SVM {
     /**
      * Constructor initializes the Support Vector Machine with default or user-specified options
-     * @param {{C: Number, tol: Number, maxPasses: Number, maxIterations: Number, kernel: 'linear'|'poly'|'rbf'|'sigmoid', 'alphaTol':Number, random: Math.random}} options Configuration options for the SVM
+     * @param {{cost: Number, tol: Number, maxPasses: Number, maxIterations: Number, kernel: 'linear'|'poly'|'rbf'|'sigmoid', 'alphaTol':Number, random: Math.random, kernelOptions: {degree: number, gamma: number, coef0: number, sigma: number}}} options Configuration options for the SVM
      */
     constructor(options = {}) {
         // Default options
         this.options = {
-            C: 1,
+            cost: 1,
             tol: 1e-4,
             alphaTol: 1e-6,
             maxPasses: 10,
@@ -24,7 +24,9 @@ class SVM{
         this.b = 0; // Bias term
         this.alphas = []; // Lagrange multipliers
         this.X = []; // Training features
-        this.Y = []; // Training labels
+        this.Y = []; // Original training labels
+        this.labelsMap = {}; // Map from original labels to +1/-1
+        this.inverseLabelsMap = {}; // Map back from +1/-1 to original labels
         this.supportVectorIdx = []; // Indices of support vectors
         this.confusion = {
             TP: 0,
@@ -41,9 +43,36 @@ class SVM{
     }
 
     /**
+     * Internal method to encode labels to +1/-1
+     * @param {Array} labels - Original labels
+     */
+    _encodeLabels(labels) {
+        const uniqueLabels = Array.from(new Set(labels));
+        if (uniqueLabels.length !== 2) {
+            throw new Error('This implementation supports binary classification with exactly two classes.');
+        }
+        this.labelsMap = {};
+        this.inverseLabelsMap = {};
+        this.labelsMap[uniqueLabels[0]] = -1;
+        this.labelsMap[uniqueLabels[1]] = 1;
+        this.inverseLabelsMap[-1] = uniqueLabels[0];
+        this.inverseLabelsMap[1] = uniqueLabels[1];
+        return labels.map(l => this.labelsMap[l]);
+    }
+
+    /**
+     * Decodes internal +1/-1 labels back to original labels
+     * @param {Number} label - Internal label (+1 or -1)
+     * @returns {Any} Original label
+     */
+    _decodeLabel(label) {
+        return this.inverseLabelsMap[label];
+    }
+
+    /**
      * Computes the confusion matrix components: TP, FP, TN, FN
      * @param {Array} features - Array of feature vectors
-     * @param {Array} labels - True labels corresponding to features
+     * @param {Array} labels - True labels
      * @returns {SVM} Object with counts
      */
     _confusion(features, labels) {
@@ -105,7 +134,7 @@ class SVM{
         this._confusion(features, labels);
         const TP = this.confusion.TP;
         const FP = this.confusion.FP;
-        if (TP + FP === 0) return 0;
+        if (TP + FP === 0) return this;
         this.metrics['precision'] = TP / (TP + FP);
         return this;
     }
@@ -120,7 +149,7 @@ class SVM{
         this._confusion(features, labels);
         const TP = this.confusion.TP;
         const FN = this.confusion.FN;
-        if (TP + FN === 0) return 0;
+        if (TP + FN === 0) return this;
         this.metrics['recall'] = TP / (TP + FN);
         return this;
     }
@@ -130,10 +159,9 @@ class SVM{
      * @returns {SVM} F1 score
      */
     _F1Score() {
-        if(!this.metrics.precision||!this.metrics.recall) throw new Error("You must trigger _precision and _recall method.");
         const prec = this.metrics.precision;
         const rec = this.metrics.recall;
-        if (prec + rec === 0) return 0;
+        if (prec + rec === 0) return this;
         this.metrics['F1'] = 2 * (prec * rec) / (prec + rec);
         return this;
     }
@@ -218,7 +246,9 @@ class SVM{
         }
         const whitened = [];
         for (let j = 0; j < features.length; j++) {
-            whitened[j] = (features[j] - this.minMax[j].min) / (this.minMax[j].max - this.minMax[j].min);
+            const min = this.minMax[j].min;
+            const max = this.minMax[j].max;
+            whitened[j] = (features[j] - min) / (max - min);
         }
         return whitened;
     }
@@ -226,7 +256,7 @@ class SVM{
     /**
      * Trains the SVM model with provided features and labels
      * @param {Array} features - Array of feature vectors
-     * @param {Array} labels Corresponding labels
+     * @param {Array} labels - Original labels
      */
     train(features, labels) {
         if (features.length !== labels.length) {
@@ -238,8 +268,14 @@ class SVM{
 
         this._trained = false;
         this._loaded = false;
-        const N = labels.length;
-        const D = features[0].length;
+
+        // Encode labels to +1/-1
+        const encodedLabels = this._encodeLabels(labels);
+        this.Y = encodedLabels;
+        this.X = features.slice();
+
+        const N = this.Y.length;
+        const D = this.X[0].length;
 
         // Normalize data if whitening is enabled
         if (this.options.whitening) {
@@ -247,17 +283,16 @@ class SVM{
             for (let j = 0; j < D; j++) {
                 const col = [];
                 for (let i = 0; i < N; i++) {
-                    col.push(features[i][j]);
+                    col.push(this.X[i][j]);
                 }
                 const min = Math.min(...col);
                 const max = Math.max(...col);
                 this.minMax[j] = { min, max };
             }
-            this.X = features.map(f => this._applyWhitening(f));
+            this.X = this.X.map(f => this._applyWhitening(f));
         } else {
-            this.X = features.slice();
+            this.minMax = null;
         }
-        this.Y = labels.slice();
 
         // Initialize alpha coefficients
         const alphas = new Array(N).fill(0);
@@ -286,7 +321,7 @@ class SVM{
 
                 // Check if sample violates KKT conditions
                 if (
-                    (this.Y[i] * Ei < -this.options.tol && this.alphas[i] < this.options.C) ||
+                    (this.Y[i] * Ei < -this.options.tol && this.alphas[i] < this.options.cost) ||
                     (this.Y[i] * Ei > this.options.tol && this.alphas[i] > 0)
                 ) {
                     // Select j randomly different from i
@@ -302,11 +337,11 @@ class SVM{
                     // Compute bounds L and H for alpha_j
                     let L, H;
                     if (this.Y[i] === this.Y[j]) {
-                        L = Math.max(0, alphaJold + alphaIold - this.options.C);
-                        H = Math.min(this.options.C, alphaJold + alphaIold);
+                        L = Math.max(0, alphaJold + alphaIold - this.options.cost);
+                        H = Math.min(this.options.cost, alphaJold + alphaIold);
                     } else {
                         L = Math.max(0, alphaJold - alphaIold);
-                        H = Math.min(this.options.C, this.options.C + alphaJold - alphaIold);
+                        H = Math.min(this.options.cost, this.options.cost + alphaJold - alphaIold);
                     }
                     if (Math.abs(L - H) < 1e-4) continue;
 
@@ -321,14 +356,14 @@ class SVM{
 
                     if (Math.abs(alphaJnew - alphaJold) < 1e-4) continue;
 
-                    // Update alpha_i accordingly
+                    // Compute new alpha_i
                     const alphaInew = alphaIold + this.Y[i] * this.Y[j] * (alphaJold - alphaJnew);
 
                     // Update alphas
                     this.alphas[i] = alphaInew;
                     this.alphas[j] = alphaJnew;
 
-                    // Compute bias terms
+                    // Compute bias
                     const b1 =
                         this.b -
                         Ei -
@@ -341,15 +376,14 @@ class SVM{
                         this.Y[i] * (alphaInew - alphaIold) * K[i][j] -
                         this.Y[j] * (alphaJnew - alphaJold) * K[j][j];
 
-                    // Update bias based on alpha bounds
                     if (
                         this.alphas[i] > this.options.alphaTol &&
-                        this.alphas[i] < this.options.C - this.options.alphaTol
+                        this.alphas[i] < this.options.cost - this.options.alphaTol
                     ) {
                         this.b = b1;
                     } else if (
                         this.alphas[j] > this.options.alphaTol &&
-                        this.alphas[j] < this.options.C - this.options.alphaTol
+                        this.alphas[j] < this.options.cost - this.options.alphaTol
                     ) {
                         this.b = b2;
                     } else {
@@ -404,27 +438,30 @@ class SVM{
         this.alphas = newAlphas;
         this.N = this.X.length;
         this._trained = true; // Mark as trained
-        this._confusion(features,labels);
-        this._accuracy(features,labels);
-        this._precision(features,labels);
-        this._recall(features,labels);
+
+        // Evaluate metrics on training data
+        this._confusion(features, labels);
+        this._accuracy(features, labels);
+        this._precision(features, labels);
+        this._recall(features, labels);
         this._F1Score();
     }
 
     /**
      * Predicts the class label for a single sample
      * @param {Array} sample - Feature vector
-     * @returns {Number} Predicted class label (+1 or -1)
+     * @returns {Number} Predicted class label (original label)
      */
     predictOne(sample) {
         const margin = this.marginOne(sample);
-        return margin > 0 ? 1 : -1;
+        const predictedLabel = margin > 0 ? 1 : -1;
+        return this._decodeLabel(predictedLabel);
     }
 
     /**
      * Predicts class labels for multiple samples
      * @param {Array} features - Array of feature vectors
-     * @returns {Array} Predicted labels
+     * @returns {Array} Predicted labels (original labels)
      */
     predict(features) {
         if (!this._trained && !this._loaded) {
@@ -462,7 +499,7 @@ class SVM{
     }
 
     /**
-     * Computes the margin for a sample using precomputed kernel matrix
+     * Computes the margin for a support vector using precomputed kernel matrix
      * @param {Number} index - Index of support vector
      * @param {Array} kernelMatrix - Precomputed kernel matrix
      * @returns {Number} Margin value
@@ -503,7 +540,9 @@ class SVM{
             W: this.W ? this.W.slice() : null,
             X: this.X.slice(),
             Y: this.Y.slice(),
-            alphas: this.alphas.slice()
+            alphas: this.alphas.slice(),
+            labelsMap: this.labelsMap,
+            inverseLabelsMap: this.inverseLabelsMap
         };
         return model;
     }
@@ -521,6 +560,8 @@ class SVM{
         svm.X = model.X.slice();
         svm.Y = model.Y.slice();
         svm.alphas = model.alphas.slice();
+        svm.labelsMap = model.labelsMap;
+        svm.inverseLabelsMap = model.inverseLabelsMap;
         svm._loaded = true;
         svm._trained = false;
         return svm;
